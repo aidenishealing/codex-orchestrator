@@ -11,9 +11,43 @@ export interface TmuxSession {
 }
 
 const SESSION_COMPLETE_MARKER = "[codex-agent: Session complete";
+const MODEL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function validateModelName(model: string): string {
+  if (!MODEL_NAME_PATTERN.test(model)) {
+    throw new Error("Invalid Codex model name");
+  }
+
+  return model;
+}
+
+export function buildCodexArgs(options: {
+  model: string;
+  reasoningEffort: string;
+  sandbox: string;
+  notifyHook: string;
+  jobId: string;
+}): string {
+  const model = validateModelName(options.model);
+  const notifyConfig = `notify=${JSON.stringify([
+    "bun",
+    "run",
+    options.notifyHook,
+    options.jobId,
+  ])}`;
+
+  return [
+    `-c`, shellQuote(`model="${model}"`),
+    `-c`, shellQuote(`model_reasoning_effort="${options.reasoningEffort}"`),
+    `-c`, shellQuote("skip_update_check=true"),
+    `-c`, shellQuote(notifyConfig),
+    `--sandbox`, shellQuote(options.sandbox),
+    `--ask-for-approval`, shellQuote("never"),
+  ].join(" ");
 }
 
 function listManagedSessionNames(): string[] {
@@ -98,14 +132,13 @@ export function createSession(options: {
   try {
     // Build codex args - pass prompt as a CLI argument via $(cat promptFile)
     // so codex starts processing immediately (no fragile tmux send-keys)
-    const codexArgs = [
-      `-c`, `model="${options.model}"`,
-      `-c`, `model_reasoning_effort="${options.reasoningEffort}"`,
-      `-c`, `skip_update_check=true`,
-      `-c`, shellQuote(`notify=["bun","run","${notifyHook}","${options.jobId}"]`),
-      `-a`, `never`,
-      `-s`, options.sandbox,
-    ].join(" ");
+    const codexArgs = buildCodexArgs({
+      model: options.model,
+      reasoningEffort: options.reasoningEffort,
+      sandbox: options.sandbox,
+      notifyHook,
+      jobId: options.jobId,
+    });
 
     const indexFile = `${config.jobsDir}/index.json`;
     const completionScript = [
@@ -113,6 +146,19 @@ export function createSession(options: {
       `const jobPath = process.argv[1];`,
       `const exitCode = Number(process.argv[2] ?? "0");`,
       `const indexPath = process.argv[3];`,
+      `const logPath = process.argv[4];`,
+      `function parseUsage(text) {`,
+      `  const pattern = /Token usage:\\s*total=([\\d,]+)\\s+input=([\\d,]+)(?:\\s+\\(\\+\\s*([\\d,]+)\\s+cached\\))?\\s+output=([\\d,]+)/gi;`,
+      `  let usage = null;`,
+      `  for (const match of text.matchAll(pattern)) {`,
+      `    const total = Number.parseInt(match[1].replaceAll(",", ""), 10);`,
+      `    const input = Number.parseInt(match[2].replaceAll(",", ""), 10);`,
+      `    const cached_input = match[3] ? Number.parseInt(match[3].replaceAll(",", ""), 10) : 0;`,
+      `    const output = Number.parseInt(match[4].replaceAll(",", ""), 10);`,
+      `    if ([total, input, cached_input, output].every(Number.isFinite)) usage = { total, input, cached_input, output };`,
+      `  }`,
+      `  return usage;`,
+      `}`,
       `try {`,
       `  const job = JSON.parse(readFileSync(jobPath, "utf-8"));`,
       `  if (job.status === "running" || job.status === "pending") {`,
@@ -122,6 +168,10 @@ export function createSession(options: {
       `    if (exitCode !== 0 && !job.error) {`,
       `      job.error = \`Codex exited with code \${exitCode}\`;`,
       `    }`,
+      `    try {`,
+      `      const usage = parseUsage(readFileSync(logPath, "utf-8"));`,
+      `      if (usage) job.usage = usage;`,
+      `    } catch {}`,
       `    writeFileSync(jobPath, JSON.stringify(job, null, 2));`,
       `  }`,
       `  try {`,
@@ -141,7 +191,7 @@ export function createSession(options: {
 
     const completionHook = [
       `exit_code=$?`,
-      `bun -e ${shellQuote(completionScript)} ${shellQuote(jobFile)} "$exit_code" ${shellQuote(indexFile)}`,
+      `bun -e ${shellQuote(completionScript)} ${shellQuote(jobFile)} "$exit_code" ${shellQuote(indexFile)} ${shellQuote(logFile)}`,
       `echo "\\n\\n[codex-agent: Session complete. Closing in 5s.]"`,
       `sleep 5`,
       `tmux kill-session -t ${shellQuote(sessionName)}`,
@@ -155,8 +205,8 @@ export function createSession(options: {
     const isLinux = process.platform === "linux";
     const codexCmd = `codex ${codexArgs} "$(cat ${shellQuote(promptFile)})"`;
     const shellCmd = isLinux
-      ? `script -q -e -c ${shellQuote(codexCmd)} "${logFile}"; ${completionHook}`
-      : `script -q "${logFile}" ${codexCmd}; ${completionHook}`;
+      ? `script -q -e -c ${shellQuote(codexCmd)} ${shellQuote(logFile)}; ${completionHook}`
+      : `script -q ${shellQuote(logFile)} ${codexCmd}; ${completionHook}`;
 
     const tmuxResult = spawnSync(
       "tmux",

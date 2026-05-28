@@ -1,7 +1,7 @@
 // Job management for async codex agent execution with tmux
 
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, unlinkSync, statSync, renameSync } from "fs";
-import { join } from "path";
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, renameSync } from "fs";
+import { join, resolve, sep } from "path";
 import { config, ReasoningEffort, SandboxMode } from "./config.ts";
 import { randomBytes } from "crypto";
 import { extractSessionId, findSessionFile, parseSessionFile, type ParsedSessionData } from "./session-parser.ts";
@@ -18,10 +18,21 @@ import {
   sendControl,
 } from "./tmux.ts";
 import { clearSignalFile, signalFileExists, readSignalFile, type TurnEvent } from "./watcher.ts";
+import { deriveJobView, JOB_STATE_SCHEMA_VERSION, normalizeJobLifecycle } from "./state.ts";
+import type {
+  BlockerKind,
+  LegacyTurnState,
+  OrchestrationState,
+  ProcessState,
+  TurnState,
+} from "./state.ts";
+import type { PromptContextAccounting } from "./prompt-context.ts";
+import { parseCodexTokenUsage, type CodexTokenUsage } from "./usage-parser.ts";
 
 export interface Job {
   id: string;
   status: "pending" | "running" | "completed" | "failed";
+  processState?: ProcessState;
   prompt: string;
   model: string;
   reasoningEffort: ReasoningEffort;
@@ -35,10 +46,16 @@ export interface Job {
   result?: string;
   error?: string;
   // Turn tracking
+  turnsCompleted?: number;
   turnCount?: number;
   lastTurnCompletedAt?: string;
   lastAgentMessage?: string;
-  turnState?: "working" | "idle" | "context_limit";
+  turnState?: LegacyTurnState;
+  blockerKind?: BlockerKind | null;
+  promptEstimatedTokens?: number;
+  promptBytes?: number;
+  promptContext?: PromptContextAccounting;
+  usage?: CodexTokenUsage;
 }
 
 interface JobIndexEntry {
@@ -63,8 +80,66 @@ function generateJobId(): string {
   return randomBytes(4).toString("hex");
 }
 
-function getJobPath(jobId: string): string {
-  return join(config.jobsDir, `${jobId}.json`);
+const JOB_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+function isValidJobId(jobId: string): boolean {
+  return JOB_ID_PATTERN.test(jobId);
+}
+
+function isUnderJobsDir(filePath: string): boolean {
+  const jobsDir = resolve(config.jobsDir);
+  const resolved = resolve(filePath);
+  return resolved === jobsDir || resolved.startsWith(`${jobsDir}${sep}`);
+}
+
+function getJobArtifactPath(jobId: string, extension: string): string | null {
+  if (!isValidJobId(jobId)) return null;
+
+  const artifactPath = resolve(config.jobsDir, `${jobId}${extension}`);
+  return isUnderJobsDir(artifactPath) ? artifactPath : null;
+}
+
+function getJobPath(jobId: string): string | null {
+  return getJobArtifactPath(jobId, ".json");
+}
+
+function getJobTrashDir(jobId: string): string | null {
+  if (!isValidJobId(jobId)) return null;
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const trashDir = resolve(config.jobsDir, ".trash", `${stamp}-${process.pid}-${jobId}`);
+  return isUnderJobsDir(trashDir) ? trashDir : null;
+}
+
+export function archiveJobArtifacts(jobId: string): string[] {
+  ensureJobsDir();
+  const trashDir = getJobTrashDir(jobId);
+  if (!trashDir) return [];
+
+  const artifactExtensions = [".json", ".prompt", ".log", ".turn-complete"];
+  const archived: string[] = [];
+
+  for (const ext of artifactExtensions) {
+    const source = getJobArtifactPath(jobId, ext);
+    if (!source) continue;
+
+    try {
+      statSync(source);
+    } catch {
+      continue;
+    }
+
+    mkdirSync(trashDir, { recursive: true });
+    const target = join(trashDir, `${jobId}${ext}`);
+    try {
+      renameSync(source, target);
+      archived.push(target);
+    } catch {
+      // Best-effort archive: leave any artifact in place if it cannot be moved.
+    }
+  }
+
+  return archived;
 }
 
 function createEmptyJobIndex(): JobIndex {
@@ -218,12 +293,19 @@ function listRecentJobFilesByMtime(activeJobIds: Set<string>, limit: number): st
 
 export function saveJob(job: Job): void {
   ensureJobsDir();
-  writeFileSync(getJobPath(job.id), JSON.stringify(job, null, 2));
-  syncJobIndex(job);
+  const normalized = normalizeJobLifecycle(job);
+  const jobPath = getJobPath(job.id);
+  if (!jobPath) {
+    throw new Error(`Invalid job id: ${job.id}`);
+  }
+
+  writeFileSync(jobPath, JSON.stringify(normalized, null, 2));
+  syncJobIndex(normalized);
 }
 
 export function loadJob(jobId: string): Job | null {
-  return loadJobFromPath(getJobPath(jobId));
+  const jobPath = getJobPath(jobId);
+  return jobPath ? loadJobFromPath(jobPath) : null;
 }
 
 export function listJobs(options: ListJobsOptions = {}): Job[] {
@@ -261,7 +343,9 @@ function computeElapsedMs(job: Job): number {
 }
 
 function getLogMtimeMs(jobId: string): number | null {
-  const logFile = join(config.jobsDir, `${jobId}.log`);
+  const logFile = getJobArtifactPath(jobId, ".log");
+  if (!logFile) return null;
+
   try {
     return statSync(logFile).mtimeMs;
   } catch {
@@ -290,7 +374,9 @@ function isInactiveTimedOut(job: Job): boolean {
 }
 
 function loadSessionData(jobId: string): ParsedSessionData | null {
-  const logFile = join(config.jobsDir, `${jobId}.log`);
+  const logFile = getJobArtifactPath(jobId, ".log");
+  if (!logFile) return null;
+
   let logContent: string;
 
   try {
@@ -308,23 +394,235 @@ function loadSessionData(jobId: string): ParsedSessionData | null {
   return parseSessionFile(sessionFile);
 }
 
-export type JobsJsonEntry = {
+function loadCodexUsage(jobId: string): CodexTokenUsage | null {
+  const logFile = getJobArtifactPath(jobId, ".log");
+  if (!logFile) return null;
+
+  try {
+    return parseCodexTokenUsage(readFileSync(logFile, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+function isSameUsage(a: CodexTokenUsage | undefined, b: CodexTokenUsage): boolean {
+  return (
+    a?.total === b.total &&
+    a.input === b.input &&
+    a.cached_input === b.cached_input &&
+    a.output === b.output
+  );
+}
+
+function persistCodexUsageFromLog(job: Job): Job {
+  const usage = loadCodexUsage(job.id);
+  if (!usage || isSameUsage(job.usage, usage)) return job;
+
+  const updated = { ...job, usage };
+  saveJob(updated);
+  return updated;
+}
+
+function getLastActivityAt(job: Job, derivedLastActivityAt: string | null): string | null {
+  const logMtime = getLogMtimeMs(job.id);
+  if (logMtime !== null) return new Date(logMtime).toISOString();
+  return derivedLastActivityAt;
+}
+
+function getStaleAfterMs(): number | null {
+  if (!Number.isFinite(config.defaultTimeout) || config.defaultTimeout <= 0) return null;
+  return config.defaultTimeout * 60 * 1000;
+}
+
+type CompactJobContext = {
+  prompt_estimated_tokens: number;
+  prompt_bytes: number;
+  map: {
+    included: boolean;
+    path: string | null;
+    estimated_tokens: number;
+    bytes: number;
+    cartographer_total_tokens: number | null;
+  };
+  components: {
+    kind: string;
+    label: string;
+    estimated_tokens: number;
+    bytes: number;
+  }[];
+};
+
+function buildCompactContext(job: Job): CompactJobContext | null {
+  const accounting = job.promptContext;
+  if (!accounting) {
+    if (job.promptEstimatedTokens === undefined && job.promptBytes === undefined) return null;
+    return {
+      prompt_estimated_tokens: job.promptEstimatedTokens ?? 0,
+      prompt_bytes: job.promptBytes ?? 0,
+      map: {
+        included: false,
+        path: null,
+        estimated_tokens: 0,
+        bytes: 0,
+        cartographer_total_tokens: null,
+      },
+      components: [],
+    };
+  }
+
+  return {
+    prompt_estimated_tokens: accounting.estimatedTokens,
+    prompt_bytes: accounting.bytes,
+    map: {
+      included: accounting.map.included,
+      path: accounting.map.path,
+      estimated_tokens: accounting.map.estimatedTokens,
+      bytes: accounting.map.bytes,
+      cartographer_total_tokens: accounting.map.cartographerTotalTokens,
+    },
+    components: accounting.components.map((component) => ({
+      kind: component.kind,
+      label: component.label,
+      estimated_tokens: component.estimatedTokens,
+      bytes: component.bytes,
+    })),
+  };
+}
+
+function getRecommendedNext(state: OrchestrationState): string {
+  switch (state) {
+    case "PENDING":
+    case "STARTING":
+    case "WORKING":
+      return "await_turn";
+    case "WAITING":
+      return "send_or_close";
+    case "BLOCKED":
+      return "resolve_blocker";
+    case "STALE":
+      return "inspect_or_cancel";
+    case "COMPLETED":
+      return "close";
+    case "FAILED":
+      return "inspect_failure";
+    case "CANCELLED":
+      return "none";
+  }
+}
+
+function getLastMessage(job: Job, sessionData: ParsedSessionData | null): string | null {
+  if (job.lastAgentMessage) return job.lastAgentMessage;
+  if (sessionData?.summary) return truncateText(sessionData.summary, 500);
+  return null;
+}
+
+export type CompactJobJson = {
+  schema_version: typeof JOB_STATE_SCHEMA_VERSION;
   id: string;
+  orchestration_state: OrchestrationState;
   status: Job["status"];
-  prompt: string;
+  process_state: ProcessState;
+  turn_state: TurnState;
+  blocker_kind: BlockerKind | null;
+  turns_completed: number;
+  last_message: string | null;
+  last_activity_at: string | null;
+  usage: CodexTokenUsage | null;
+  context: CompactJobContext | null;
+  actions: {
+    recommended_next: string;
+  };
   model: string;
   reasoning: ReasoningEffort;
+  sandbox: SandboxMode;
   cwd: string;
-  elapsed_ms: number;
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
-  tokens: ParsedSessionData["tokens"] | null;
+  error: string | null;
+};
+
+export function buildCompactJobJson(job: Job): CompactJobJson {
+  const derived = deriveJobView(job, { staleAfterMs: getStaleAfterMs() });
+  const sessionData = job.status === "completed" ? loadSessionData(job.id) : null;
+
+  return {
+    schema_version: JOB_STATE_SCHEMA_VERSION,
+    id: job.id,
+    orchestration_state: derived.orchestrationState,
+    status: job.status,
+    process_state: derived.processState,
+    turn_state: derived.turnState,
+    blocker_kind: derived.blockerKind,
+    turns_completed: derived.turnsCompleted,
+    last_message: getLastMessage(job, sessionData),
+    last_activity_at: getLastActivityAt(job, derived.lastActivityAt),
+    usage: job.usage ?? loadCodexUsage(job.id),
+    context: buildCompactContext(job),
+    actions: {
+      recommended_next: getRecommendedNext(derived.orchestrationState),
+    },
+    model: job.model,
+    reasoning: job.reasoningEffort,
+    sandbox: job.sandbox,
+    cwd: job.cwd,
+    created_at: job.createdAt,
+    started_at: job.startedAt ?? null,
+    completed_at: job.completedAt ?? null,
+    error: job.error ?? null,
+  };
+}
+
+export type StatusJsonOutput = {
+  schema_version: typeof JOB_STATE_SCHEMA_VERSION;
+  generated_at: string;
+  job: CompactJobJson;
+};
+
+export function getStatusJson(jobId: string): StatusJsonOutput | null {
+  const refreshed = refreshJobStatus(jobId);
+  const job = refreshed ? persistCodexUsageFromLog(refreshed) : null;
+  if (!job) return null;
+
+  return {
+    schema_version: JOB_STATE_SCHEMA_VERSION,
+    generated_at: new Date().toISOString(),
+    job: buildCompactJobJson(job),
+  };
+}
+
+export type JobsJsonEntry = {
+  id: string;
+  status: Job["status"];
+  schema_version: typeof JOB_STATE_SCHEMA_VERSION;
+  orchestration_state: OrchestrationState;
+  process_state: ProcessState;
+  turn_state: TurnState;
+  blocker_kind: BlockerKind | null;
+  turns_completed: number;
+  last_message: string | null;
+  last_activity_at: string | null;
+  usage: CodexTokenUsage | null;
+  context: CompactJobContext | null;
+  actions: {
+    recommended_next: string;
+  };
+  prompt_preview: string;
+  elapsed_ms: number;
+  model: string;
+  reasoning: ReasoningEffort;
+  sandbox: SandboxMode;
+  cwd: string;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  error: string | null;
   files_modified: ParsedSessionData["files_modified"] | null;
   summary: string | null;
 };
 
 export type JobsJsonOutput = {
+  schema_version: typeof JOB_STATE_SCHEMA_VERSION;
   generated_at: string;
   jobs: JobsJsonEntry[];
 };
@@ -333,17 +631,16 @@ export function getJobsJson(options: ListJobsOptions = {}): JobsJsonOutput {
   const jobs = listJobs(options);
   const enriched = jobs.map((job) => {
     const refreshed = (job.status === "running" || job.status === "pending") ? refreshJobStatus(job.id) : null;
-    const effective = refreshed ?? job;
+    const effective = persistCodexUsageFromLog(refreshed ?? job);
     const elapsedMs = computeElapsedMs(effective);
+    const compact = buildCompactJobJson(effective);
 
-    let tokens: ParsedSessionData["tokens"] | null = null;
     let filesModified: ParsedSessionData["files_modified"] | null = null;
     let summary: string | null = null;
 
     if (effective.status === "completed") {
       const sessionData = loadSessionData(effective.id);
       if (sessionData) {
-        tokens = sessionData.tokens;
         filesModified = sessionData.files_modified;
         summary = sessionData.summary ? truncateText(sessionData.summary, 500) : null;
       }
@@ -352,23 +649,51 @@ export function getJobsJson(options: ListJobsOptions = {}): JobsJsonOutput {
     return {
       id: effective.id,
       status: effective.status,
-      prompt: truncateText(effective.prompt, 100),
-      model: effective.model,
-      reasoning: effective.reasoningEffort,
-      cwd: effective.cwd,
+      schema_version: compact.schema_version,
+      orchestration_state: compact.orchestration_state,
+      process_state: compact.process_state,
+      turn_state: compact.turn_state,
+      blocker_kind: compact.blocker_kind,
+      turns_completed: compact.turns_completed,
+      last_message: compact.last_message,
+      last_activity_at: compact.last_activity_at,
+      usage: compact.usage,
+      context: compact.context,
+      actions: compact.actions,
+      prompt_preview: truncateText(effective.prompt, 100),
       elapsed_ms: elapsedMs,
+      model: compact.model,
+      reasoning: compact.reasoning,
+      sandbox: compact.sandbox,
+      cwd: compact.cwd,
       created_at: effective.createdAt,
       started_at: effective.startedAt ?? null,
       completed_at: effective.completedAt ?? null,
-      tokens,
+      error: effective.error ?? null,
       files_modified: filesModified,
       summary,
     };
   });
 
+  const statusRank: Record<Job["status"], number> = {
+    running: 0,
+    pending: 1,
+    failed: 2,
+    completed: 3,
+  };
+  enriched.sort((a, b) => {
+    const rankDiff = statusRank[a.status] - statusRank[b.status];
+    if (rankDiff !== 0) return rankDiff;
+    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+  });
+
+  const limit = options.all ? null : options.limit;
+  const bounded = limit && limit > 0 ? enriched.slice(0, limit) : enriched;
+
   return {
+    schema_version: JOB_STATE_SCHEMA_VERSION,
     generated_at: new Date().toISOString(),
-    jobs: enriched,
+    jobs: bounded,
   };
 }
 
@@ -380,26 +705,16 @@ export function deleteJob(jobId: string): boolean {
     killSession(job.tmuxSession);
   }
 
-  try {
-    unlinkSync(getJobPath(jobId));
-    // Clean up auxiliary files
-    const auxiliaryExtensions = [".prompt", ".log", ".turn-complete"];
-    for (const ext of auxiliaryExtensions) {
-      try {
-        unlinkSync(join(config.jobsDir, `${jobId}${ext}`));
-      } catch {
-        // File may not exist
-      }
-    }
-    removeJobFromIndex(jobId);
-    return true;
-  } catch {
-    return false;
-  }
+  const archived = archiveJobArtifacts(jobId);
+  if (archived.length === 0) return false;
+
+  removeJobFromIndex(jobId);
+  return true;
 }
 
 export interface StartJobOptions {
   prompt: string;
+  promptContext?: PromptContextAccounting;
   model?: string;
   reasoningEffort?: ReasoningEffort;
   sandbox?: SandboxMode;
@@ -424,6 +739,9 @@ export function startJob(options: StartJobOptions): Job {
     parentSessionId: options.parentSessionId,
     cwd,
     createdAt: new Date().toISOString(),
+    promptEstimatedTokens: options.promptContext?.estimatedTokens,
+    promptBytes: options.promptContext?.bytes,
+    promptContext: options.promptContext,
   };
 
   // Record the session name BEFORE creating it so orphan cleanup
@@ -506,7 +824,9 @@ export function getJobOutput(jobId: string, lines?: number): string | null {
   }
 
   // Fall back to log file
-  const logFile = join(config.jobsDir, `${jobId}.log`);
+  const logFile = getJobArtifactPath(jobId, ".log");
+  if (!logFile) return null;
+
   try {
     const content = readFileSync(logFile, "utf-8");
     if (lines) {
@@ -530,7 +850,9 @@ export function getJobFullOutput(jobId: string): string | null {
   }
 
   // Fall back to log file
-  const logFile = join(config.jobsDir, `${jobId}.log`);
+  const logFile = getJobArtifactPath(jobId, ".log");
+  if (!logFile) return null;
+
   try {
     return readFileSync(logFile, "utf-8");
   } catch {
@@ -587,13 +909,13 @@ export function refreshJobStatus(jobId: string): Job | null {
       if (output && output.includes("[codex-agent: Session complete")) {
         job.status = "completed";
         job.completedAt = new Date().toISOString();
-        saveJob(job);
+        saveJob(persistCodexUsageFromLog(job));
       } else {
         // Session is alive - promote to running
         job.status = "running";
         job.startedAt = job.startedAt || new Date().toISOString();
         job.turnState = "working";
-        saveJob(job);
+        saveJob(persistCodexUsageFromLog(job));
       }
     } else {
       // No session and pending for >5 min = orphaned
@@ -602,7 +924,7 @@ export function refreshJobStatus(jobId: string): Job | null {
         job.status = "failed";
         job.error = "Orphaned pending job - no tmux session found";
         job.completedAt = new Date().toISOString();
-        saveJob(job);
+        saveJob(persistCodexUsageFromLog(job));
       }
     }
     return loadJob(jobId);
@@ -615,7 +937,7 @@ export function refreshJobStatus(jobId: string): Job | null {
       job.status = "failed";
       job.error = "Orphaned pending job - session never created";
       job.completedAt = new Date().toISOString();
-      saveJob(job);
+      saveJob(persistCodexUsageFromLog(job));
     }
     return loadJob(jobId);
   }
@@ -626,13 +948,15 @@ export function refreshJobStatus(jobId: string): Job | null {
       // Session ended completely
       job.status = "completed";
       job.completedAt = new Date().toISOString();
-      const logFile = join(config.jobsDir, `${jobId}.log`);
+      const logFile = getJobArtifactPath(jobId, ".log");
       try {
-        job.result = readFileSync(logFile, "utf-8");
+        if (logFile) {
+          job.result = readFileSync(logFile, "utf-8");
+        }
       } catch {
         // No log file
       }
-      saveJob(job);
+      saveJob(persistCodexUsageFromLog(job));
     } else {
       const latestJob = loadJob(jobId);
       if (latestJob && latestJob.status !== "running") {
@@ -650,18 +974,18 @@ export function refreshJobStatus(jobId: string): Job | null {
         if (fullOutput) {
           job.result = fullOutput;
         }
-        saveJob(job);
+        saveJob(persistCodexUsageFromLog(job));
       } else if (isInactiveTimedOut(job)) {
         killSession(job.tmuxSession);
         job.status = "failed";
         job.error = `Timed out after ${config.defaultTimeout} minutes of inactivity`;
         job.completedAt = new Date().toISOString();
-        saveJob(job);
+        saveJob(persistCodexUsageFromLog(job));
       }
     }
   }
 
-  return loadJob(jobId);
+  return persistCodexUsageFromLog(loadJob(jobId) ?? job);
 }
 
 export function isJobIdle(jobId: string): boolean {

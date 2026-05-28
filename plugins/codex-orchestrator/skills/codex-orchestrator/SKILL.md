@@ -211,6 +211,8 @@ Detect where you are based on context:
 - Let agents finish their work - they are thorough for a reason
 - Trust the process - quality takes time
 
+**`await-turn` has NO wall-clock timeout.** It blocks until one of: the agent completes a turn, hits the context window, the job ends, or you SIGINT. A long-running `await-turn` does NOT mean the agent is dead - it means the agent is still working. Never re-spawn just because `await-turn` has been blocked for a while.
+
 ## Codebase Map: Giving Agents Instant Context
 
 The `--map` flag is the most important flag you'll use. It injects `docs/CODEBASE_MAP.md` into the agent's prompt - a comprehensive architecture document that gives agents instant understanding of the entire codebase: file purposes, module boundaries, data flows, dependencies, conventions, and navigation guides.
@@ -236,8 +238,8 @@ The CLI ships with strong defaults so most commands need minimal flags:
 
 | Setting | Default | Why |
 |---------|---------|-----|
-| Model | `gpt-5.4` | Full capability model with high reasoning (use `--fast` for spark) |
-| Reasoning | `high` | Deep reasoning depth - balances quality and speed |
+| Model | `gpt-5.5` | Full capability model |
+| Reasoning | `low` | Efficient default; raise with `-r high` or `-r xhigh` for harder work |
 | Sandbox | `workspace-write` | Agents can modify files by default |
 
 You almost never need to override these. The main flags you'll use are `--map` (include codebase context), `-s read-only` (for research tasks), and `-f` (include specific files).
@@ -433,8 +435,7 @@ codex-agent health                 # verify codex + tmux available
 | `--map` | | flag | Include docs/CODEBASE_MAP.md |
 | `--dir` | `-d` | path | Working directory |
 | `--model` | `-m` | string | Model override |
-| `--fast` | | flag | Use fast model (codex-spark) |
-| `--json` | | flag | JSON output (jobs only) |
+| `--json` | | flag | JSON output (`status`, `await-turn`, `jobs`) |
 | `--strip-ansi` | | flag | Clean output |
 | `--dry-run` | | flag | Preview prompt without executing |
 

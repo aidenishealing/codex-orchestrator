@@ -14,18 +14,18 @@ import {
   cleanupOldJobs,
   deleteJob,
   sendToJob,
-  sendControlToJob,
   getJobOutput,
   getJobFullOutput,
   getAttachCommand,
-  isJobIdle,
   getTurnSignal,
-  Job,
   getJobsJson,
+  getStatusJson,
+  buildCompactJobJson,
 } from "./jobs.ts";
-import { estimateTokens, loadCodebaseMap } from "./files.ts";
+import type { CompactJobJson, Job } from "./jobs.ts";
 import { isTmuxAvailable, listSessions } from "./tmux.ts";
 import { cleanTerminalOutput } from "./output-cleaner.ts";
+import { buildPromptContext, type BuiltPromptContext } from "./prompt-context.ts";
 
 const HELP = `
 Codex Agent - Delegate tasks to GPT Codex agents (tmux-based)
@@ -46,9 +46,8 @@ Usage:
   codex-agent health                     Check tmux and codex availability
 
 Options:
-  -r, --reasoning <level>    Reasoning effort: low, medium, high, xhigh (default: high)
-  -m, --model <model>        Model name (default: gpt-5.4)
-  --fast                     Use fast model (gpt-5.4-spark)
+  -r, --reasoning <level>    Reasoning effort: low, medium, high, xhigh (default: low)
+  -m, --model <model>        Model name (default: gpt-5.5)
   -s, --sandbox <mode>       Sandbox: read-only, workspace-write, danger-full-access
   -w, --wait                 Wait for completion before exiting
   --notify-on-complete <cmd>  Run command when job completes
@@ -58,7 +57,7 @@ Options:
   --dry-run                  Show prompt without executing
   --strip-ansi               Remove ANSI and Codex TUI noise from output (for capture/output)
   --clean                    Alias for --strip-ansi
-  --json                     Output JSON (jobs command only)
+  --json                     Output JSON (status, await-turn, jobs)
   --limit <n>                Limit jobs shown (jobs command only)
   --all                      Show all jobs (jobs command only)
   -h, --help                 Show this help
@@ -143,8 +142,6 @@ function parseArgs(args: string[]): {
       }
     } else if (arg === "-m" || arg === "--model") {
       options.model = args[++i];
-    } else if (arg === "--fast") {
-      options.model = config.fastModel;
     } else if (arg === "-s" || arg === "--sandbox") {
       const mode = args[++i] as SandboxMode;
       if (config.sandboxModes.includes(mode)) {
@@ -292,6 +289,294 @@ async function notifyOnCompletion(
   }
 }
 
+function printDryRun(context: BuiltPromptContext, options: Options): void {
+  const accounting = context.accounting;
+  console.log(
+    `Would send ~${accounting.estimatedTokens.toLocaleString()} tokens (${accounting.bytes.toLocaleString()} bytes)`
+  );
+  console.log(`Model: ${options.model}`);
+  console.log(`Reasoning: ${options.reasoning}`);
+  console.log(`Sandbox: ${options.sandbox}`);
+  console.log("Prompt components:");
+  for (const component of accounting.components) {
+    console.log(
+      `  - ${component.label}: ~${component.estimatedTokens.toLocaleString()} tokens, ${component.bytes.toLocaleString()} bytes`
+    );
+  }
+  console.log(
+    `Codebase map: ${accounting.map.included ? "included" : "not included"}`
+  );
+  if (accounting.map.included) {
+    console.log(`Map path: ${accounting.map.path ?? "-"}`);
+    console.log(
+      `Map prompt cost: ~${accounting.map.estimatedTokens.toLocaleString()} tokens, ${accounting.map.bytes.toLocaleString()} bytes`
+    );
+    console.log(
+      `Map metadata total_tokens: ${accounting.map.cartographerTotalTokens?.toLocaleString() ?? "-"}`
+    );
+  }
+  console.log("\n--- Prompt Preview ---\n");
+  console.log(context.prompt.slice(0, 3000));
+  if (context.prompt.length > 3000) {
+    console.log(`\n... (${context.prompt.length - 3000} more characters)`);
+  }
+}
+
+async function buildCliPromptContext(taskPrompt: string, options: Options): Promise<BuiltPromptContext> {
+  const context = await buildPromptContext({
+    taskPrompt,
+    includeMap: options.includeMap,
+    cwd: options.dir,
+  });
+
+  if (options.includeMap) {
+    console.error(context.accounting.map.included ? "Included codebase map" : "No codebase map found");
+  }
+
+  return context;
+}
+
+function formatNextAction(job: CompactJobJson): string {
+  return job.actions.recommended_next;
+}
+
+function formatHumanStatus(job: CompactJobJson): string {
+  const lines = [
+    `State: ${job.orchestration_state}`,
+    `Process: ${job.process_state}`,
+    `Turn: ${job.turn_state}${job.blocker_kind ? ` (${job.blocker_kind})` : ""}`,
+    `Turns completed: ${job.turns_completed}`,
+    `Last message: ${job.last_message ?? "-"}`,
+    `Next: ${formatNextAction(job)}`,
+    `Job: ${job.id}`,
+    `Status: ${job.status}`,
+    `Model: ${job.model} (${job.reasoning})`,
+    `Sandbox: ${job.sandbox}`,
+    `Created: ${job.created_at}`,
+  ];
+
+  if (job.started_at) lines.push(`Started: ${job.started_at}`);
+  if (job.completed_at) lines.push(`Completed: ${job.completed_at}`);
+  if (job.last_activity_at) lines.push(`Last activity: ${job.last_activity_at}`);
+  if (job.usage) {
+    lines.push(
+      `Usage: total=${job.usage.total.toLocaleString()} input=${job.usage.input.toLocaleString()} cached=${job.usage.cached_input.toLocaleString()} output=${job.usage.output.toLocaleString()}`
+    );
+  }
+  if (job.context) {
+    lines.push(
+      `Context: ~${job.context.prompt_estimated_tokens.toLocaleString()} tokens, ${job.context.prompt_bytes.toLocaleString()} bytes`
+    );
+  }
+  if (job.error) lines.push(`Error: ${job.error}`);
+
+  return lines.join("\n");
+}
+
+type AwaitTurnResult = {
+  shouldPoll: boolean;
+  exitCode: number;
+  message: string | null;
+  reason: string | null;
+  job: CompactJobJson;
+};
+
+function getAwaitTurnResult(job: Job): AwaitTurnResult {
+  const compact = buildCompactJobJson(job);
+  const fallbackMessage =
+    compact.orchestration_state === "COMPLETED" ? "Job completed" : "Turn complete";
+
+  switch (compact.orchestration_state) {
+    case "WAITING":
+      return {
+        shouldPoll: false,
+        exitCode: 0,
+        message: compact.last_message ?? fallbackMessage,
+        reason: null,
+        job: compact,
+      };
+    case "COMPLETED":
+      return {
+        shouldPoll: false,
+        exitCode: 0,
+        message: compact.last_message ?? fallbackMessage,
+        reason: null,
+        job: compact,
+      };
+    case "BLOCKED":
+      return {
+        shouldPoll: false,
+        exitCode: 2,
+        message: null,
+        reason: compact.blocker_kind
+          ? `Job is blocked: ${compact.blocker_kind}`
+          : "Job is blocked",
+        job: compact,
+      };
+    case "FAILED":
+      return {
+        shouldPoll: false,
+        exitCode: 1,
+        message: null,
+        reason: compact.error ?? "Job failed",
+        job: compact,
+      };
+    case "CANCELLED":
+      return {
+        shouldPoll: false,
+        exitCode: 1,
+        message: null,
+        reason: "Job was cancelled",
+        job: compact,
+      };
+    case "STALE":
+      return {
+        shouldPoll: false,
+        exitCode: 2,
+        message: null,
+        reason: "Job is stale",
+        job: compact,
+      };
+    case "PENDING":
+    case "STARTING":
+    case "WORKING":
+      return {
+        shouldPoll: true,
+        exitCode: 0,
+        message: null,
+        reason: null,
+        job: compact,
+      };
+  }
+}
+
+function printAwaitTurnResult(result: AwaitTurnResult, json: boolean): void {
+  if (json) {
+    console.log(
+      JSON.stringify(
+        {
+          schema_version: result.job.schema_version,
+          generated_at: new Date().toISOString(),
+          job: result.job,
+          outcome: result.exitCode === 0 ? "ready" : "not_ready",
+          message: result.message,
+          reason: result.reason,
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  if (result.exitCode === 0) {
+    console.log(result.message ?? "Turn complete");
+  } else {
+    console.error(result.reason ?? "Job cannot be awaited");
+  }
+}
+
+function markSignalTurnComplete(job: Job, signalMessage: string | null, timestamp: string): Job {
+  if (job.turnState !== "idle") {
+    job.turnsCompleted = (job.turnsCompleted ?? job.turnCount ?? 0) + 1;
+  }
+  job.lastTurnCompletedAt = timestamp;
+  job.lastAgentMessage = signalMessage;
+  job.turnState = "idle";
+  saveJob(job);
+  return loadJob(job.id) ?? job;
+}
+
+async function awaitTurn(jobId: string, json: boolean): Promise<void> {
+  const initial = refreshJobStatus(jobId);
+  if (!initial) {
+    console.error(`Job ${jobId} not found`);
+    process.exit(1);
+  }
+
+  const existingSignal = getTurnSignal(jobId);
+  if (existingSignal) {
+    const completedTurn = markSignalTurnComplete(
+      initial,
+      existingSignal.lastAgentMessage,
+      existingSignal.timestamp
+    );
+    const result = getAwaitTurnResult(completedTurn);
+    printAwaitTurnResult(result, json);
+    process.exit(result.exitCode);
+  }
+
+  const initialResult = getAwaitTurnResult(initial);
+  if (!initialResult.shouldPoll) {
+    printAwaitTurnResult(initialResult, json);
+    process.exit(initialResult.exitCode);
+  }
+
+  if (!json) {
+    console.error(`Waiting for turn completion... (job: ${jobId})`);
+  }
+
+  let stopped = false;
+  process.on("SIGINT", () => {
+    stopped = true;
+  });
+
+  let awaitTurnPollCount = 0;
+  const contextWindowText = "Codex ran out of room in the model's context window";
+
+  while (!stopped) {
+    await sleep(500);
+    awaitTurnPollCount += 1;
+
+    const signal = getTurnSignal(jobId);
+    if (signal) {
+      const current = refreshJobStatus(jobId) ?? loadJob(jobId);
+      if (!current) {
+        console.error(`Job ${jobId} not found`);
+        process.exit(1);
+      }
+      const completedTurn = markSignalTurnComplete(current, signal.lastAgentMessage, signal.timestamp);
+      const result = getAwaitTurnResult(completedTurn);
+      printAwaitTurnResult(result, json);
+      process.exit(result.exitCode);
+    }
+
+    if (awaitTurnPollCount % 5 === 0) {
+      const paneOutput = getJobOutput(jobId, 10);
+      if (paneOutput && (paneOutput.includes("ran out of room") || paneOutput.includes("context window"))) {
+        const current = loadJob(jobId);
+        if (current) {
+          current.turnState = "context_limit";
+          current.blockerKind = "context_limit";
+          current.error = contextWindowText;
+          saveJob(current);
+          const result = getAwaitTurnResult(loadJob(jobId) ?? current);
+          printAwaitTurnResult(result, json);
+          process.exit(result.exitCode);
+        }
+
+        console.error("Agent hit context window limit");
+        process.exit(2);
+      }
+    }
+
+    const current = refreshJobStatus(jobId);
+    if (!current) {
+      console.error(`Job ${jobId} not found`);
+      process.exit(1);
+    }
+
+    const result = getAwaitTurnResult(current);
+    if (!result.shouldPoll) {
+      printAwaitTurnResult(result, json);
+      process.exit(result.exitCode);
+    }
+  }
+
+  console.error("\nStopped waiting");
+  process.exit(0);
+}
+
 async function main() {
   const args = process.argv.slice(2);
 
@@ -334,6 +619,14 @@ async function main() {
           process.exit(1);
         }
 
+        const taskPrompt = positional.join(" ");
+        const promptContext = await buildCliPromptContext(taskPrompt, options);
+
+        if (options.dryRun) {
+          printDryRun(promptContext, options);
+          process.exit(0);
+        }
+
         // Check tmux first
         if (!isTmuxAvailable()) {
           console.error("Error: tmux is required but not installed");
@@ -341,35 +634,9 @@ async function main() {
           process.exit(1);
         }
 
-        let prompt = positional.join(" ");
-
-        // Include codebase map if requested
-        if (options.includeMap) {
-          const map = await loadCodebaseMap(options.dir);
-          if (map) {
-            prompt = `## Codebase Map\n\n${map}\n\n---\n\n${prompt}`;
-            console.error("Included codebase map");
-          } else {
-            console.error("No codebase map found");
-          }
-        }
-
-        if (options.dryRun) {
-          const tokens = estimateTokens(prompt);
-          console.log(`Would send ~${tokens.toLocaleString()} tokens`);
-          console.log(`Model: ${options.model}`);
-          console.log(`Reasoning: ${options.reasoning}`);
-          console.log(`Sandbox: ${options.sandbox}`);
-          console.log("\n--- Prompt Preview ---\n");
-          console.log(prompt.slice(0, 3000));
-          if (prompt.length > 3000) {
-            console.log(`\n... (${prompt.length - 3000} more characters)`);
-          }
-          process.exit(0);
-        }
-
         const job = startJob({
-          prompt,
+          prompt: promptContext.prompt,
+          promptContext: promptContext.accounting,
           model: options.model,
           reasoningEffort: options.reasoning,
           sandbox: options.sandbox,
@@ -422,38 +689,19 @@ async function main() {
           process.exit(1);
         }
 
-        console.log(`Job: ${job.id}`);
-        console.log(`Status: ${job.status}`);
-        console.log(`Model: ${job.model} (${job.reasoningEffort})`);
-        console.log(`Sandbox: ${job.sandbox}`);
-        console.log(`Created: ${job.createdAt}`);
-        if (job.startedAt) {
-          console.log(`Started: ${job.startedAt}`);
+        const statusPayload = getStatusJson(positional[0]);
+        if (!statusPayload) {
+          console.error(`Job ${positional[0]} not found`);
+          process.exit(1);
         }
-        if (job.completedAt) {
-          console.log(`Completed: ${job.completedAt}`);
+        if (options.json) {
+          console.log(JSON.stringify(statusPayload, null, 2));
+          break;
         }
+
+        console.log(formatHumanStatus(statusPayload.job));
         if (job.tmuxSession) {
           console.log(`tmux session: ${job.tmuxSession}`);
-        }
-        if (job.error) {
-          console.log(`Error: ${job.error}`);
-        }
-        if (job.turnState) {
-          if (job.turnState === "context_limit") {
-            console.log("Turn state: context_limit (context window exceeded)");
-          } else {
-            console.log(`Turn state: ${job.turnState}`);
-          }
-        }
-        if (job.turnCount) {
-          console.log(`Turns completed: ${job.turnCount}`);
-        }
-        if (job.lastTurnCompletedAt) {
-          console.log(`Last turn: ${job.lastTurnCompletedAt}`);
-        }
-        if (job.lastAgentMessage) {
-          console.log(`Last message: ${job.lastAgentMessage}`);
         }
         break;
       }
@@ -464,82 +712,7 @@ async function main() {
           process.exit(1);
         }
 
-        const awaitJobId = positional[0];
-        const awaitJob = loadJob(awaitJobId);
-
-        if (!awaitJob) {
-          console.error(`Job ${awaitJobId} not found`);
-          process.exit(1);
-        }
-
-        if (awaitJob.status !== "running") {
-          console.error(`Job ${awaitJobId} is not running (status: ${awaitJob.status})`);
-          process.exit(1);
-        }
-
-        // Check if already idle
-        const existingSignal = getTurnSignal(awaitJobId);
-        if (existingSignal) {
-          console.log(existingSignal.lastAgentMessage || "Turn complete");
-          process.exit(0);
-        }
-
-        console.error(`Waiting for turn completion... (job: ${awaitJobId})`);
-
-        let awaitTurnPollCount = 0;
-        const contextWindowText = "Codex ran out of room in the model's context window";
-        const awaitPoll = setInterval(() => {
-          awaitTurnPollCount += 1;
-
-          // Check for turn signal
-          const signal = getTurnSignal(awaitJobId);
-          if (signal) {
-            clearInterval(awaitPoll);
-            console.log(signal.lastAgentMessage || "Turn complete");
-            process.exit(0);
-          }
-
-          // Check for context window exhaustion every 5th poll (~2.5s)
-          if (awaitTurnPollCount % 5 === 0) {
-            const paneOutput = getJobOutput(awaitJobId, 10);
-            if (paneOutput && (paneOutput.includes("ran out of room") || paneOutput.includes("context window"))) {
-              const current = loadJob(awaitJobId);
-              if (current) {
-                current.turnState = "context_limit";
-                current.error = contextWindowText;
-                saveJob(current);
-              }
-
-              clearInterval(awaitPoll);
-              console.error("Agent hit context window limit");
-              console.log(contextWindowText);
-              process.exit(2);
-            }
-          }
-
-          // Check if job ended entirely
-          const current = refreshJobStatus(awaitJobId);
-          if (!current || current.status !== "running") {
-            clearInterval(awaitPoll);
-            console.error(`Job ended: ${current?.status || "unknown"}`);
-            process.exit(current?.status === "completed" ? 0 : 1);
-          }
-        }, 500);
-
-        // Timeout after 30 minutes
-        setTimeout(() => {
-          clearInterval(awaitPoll);
-          console.error("Timeout waiting for turn completion");
-          process.exit(1);
-        }, 30 * 60 * 1000);
-
-        // Handle Ctrl+C
-        process.on("SIGINT", () => {
-          clearInterval(awaitPoll);
-          console.error("\nStopped waiting");
-          process.exit(0);
-        });
-
+        await awaitTurn(positional[0], options.json);
         break;
       }
 
@@ -676,17 +849,6 @@ async function main() {
             all: options.jobsAll,
             limit,
           });
-          const statusRank: Record<Job["status"], number> = {
-            running: 0,
-            pending: 1,
-            failed: 2,
-            completed: 3,
-          };
-          payload.jobs.sort((a, b) => {
-            const rankDiff = statusRank[a.status] - statusRank[b.status];
-            if (rankDiff !== 0) return rankDiff;
-            return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-          });
           console.log(JSON.stringify(payload, null, 2));
           break;
         }
@@ -770,6 +932,14 @@ async function main() {
       default:
         // Treat as prompt for start command
         if (command) {
+          const taskPrompt = [command, ...positional].join(" ");
+          const promptContext = await buildCliPromptContext(taskPrompt, options);
+
+          if (options.dryRun) {
+            printDryRun(promptContext, options);
+            process.exit(0);
+          }
+
           // Check tmux first
           if (!isTmuxAvailable()) {
             console.error("Error: tmux is required but not installed");
@@ -777,16 +947,9 @@ async function main() {
             process.exit(1);
           }
 
-          const prompt = [command, ...positional].join(" ");
-
-          if (options.dryRun) {
-            const tokens = estimateTokens(prompt);
-            console.log(`Would send ~${tokens.toLocaleString()} tokens`);
-            process.exit(0);
-          }
-
           const job = startJob({
-            prompt,
+            prompt: promptContext.prompt,
+            promptContext: promptContext.accounting,
             model: options.model,
             reasoningEffort: options.reasoning,
             sandbox: options.sandbox,
