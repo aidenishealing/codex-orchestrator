@@ -29,6 +29,6 @@ Update this file when architecture changes.
 - Prompt/file context: `src/prompt-context.ts` and `src/files.ts`.
 
 ## Notes
-- This repo is a TypeScript/Bun CLI, not a web app with a separate server/client/lib split.
+- This repo is a TypeScript/Bun CLI, not a web app with a separate web-tier split.
 - Keep this file short and factual.
 - Prefer file paths and call chains over prose.
